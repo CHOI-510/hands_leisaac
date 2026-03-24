@@ -41,53 +41,39 @@ class DualPickOrangeBiArmEnv(BiArmTaskDirectEnv):
     """Direct env for the dual pick orange task."""
     cfg: DualPickOrangeBiArmEnvCfg
 
-    _GRIPPER_CLOSE_EPS = 1e-4
-    _GRIP_STOP_DISTANCE = 0.040
+    _MAX_GRIPPER_TARGET_STEP: float = 0.06
+    """Max per-step target change for each gripper joint during near-object closing."""
+
+    _CLOSE_CLAMP_DISTANCE: float = 0.10
+    """Enable clamp only when jaw is near the orange to keep normal open/close responsiveness."""
 
     def _setup_scene(self):
         super()._setup_scene()
 
-    def _ee_orange_distance(self, ee_frame_name: str) -> torch.Tensor:
-        ee_frame = self.scene[ee_frame_name]
-        orange = self.scene["orange"]
-        end_effector_pos = ee_frame.data.target_pos_w[:, 1, :]
-        orange_pos = orange.data.root_pos_w
-        return torch.linalg.vector_norm(orange_pos - end_effector_pos, dim=1)
+    def _pre_physics_step(self, actions: torch.Tensor) -> None:
+        super()._pre_physics_step(actions)
 
-    def _apply_action(self) -> None:
-        left_arm_action = self.actions[:, 0:6].clone()
-        right_arm_action = self.actions[:, 6:12].clone()
+        left_gripper_curr = self.scene["left_arm"].data.joint_pos[:, -1]
+        right_gripper_curr = self.scene["right_arm"].data.joint_pos[:, -1]
+        left_target = self.actions[:, 5]
+        right_target = self.actions[:, 11]
 
-        left_current_gripper = self.scene["left_arm"].data.joint_pos[:, -1]
-        right_current_gripper = self.scene["right_arm"].data.joint_pos[:, -1]
+        orange_pos = self.scene["orange"].data.root_pos_w
+        left_jaw_pos = self.scene["left_ee_frame"].data.target_pos_w[:, 1, :]
+        right_jaw_pos = self.scene["right_ee_frame"].data.target_pos_w[:, 1, :]
+        left_near_orange = torch.linalg.vector_norm(orange_pos - left_jaw_pos, dim=1) < self._CLOSE_CLAMP_DISTANCE
+        right_near_orange = torch.linalg.vector_norm(orange_pos - right_jaw_pos, dim=1) < self._CLOSE_CLAMP_DISTANCE
 
-        left_closing_cmd = left_arm_action[:, -1] < (left_current_gripper - self._GRIPPER_CLOSE_EPS)
-        right_closing_cmd = right_arm_action[:, -1] < (right_current_gripper - self._GRIPPER_CLOSE_EPS)
+        left_is_closing = left_target < left_gripper_curr
+        right_is_closing = right_target < right_gripper_curr
+        left_near_closing = torch.logical_and(left_near_orange, left_is_closing)
+        right_near_closing = torch.logical_and(right_near_orange, right_is_closing)
 
-        left_grasped = pick_orange_mdp.orange_grasped(
-            self,
-            robot_cfg=SceneEntityCfg("left_arm"),
-            ee_frame_cfg=SceneEntityCfg("left_ee_frame"),
-            object_cfg=SceneEntityCfg("orange"),
-        )
-        right_grasped = pick_orange_mdp.orange_grasped(
-            self,
-            robot_cfg=SceneEntityCfg("right_arm"),
-            ee_frame_cfg=SceneEntityCfg("right_ee_frame"),
-            object_cfg=SceneEntityCfg("orange"),
-        )
-
-        left_near_orange = self._ee_orange_distance("left_ee_frame") < self._GRIP_STOP_DISTANCE
-        right_near_orange = self._ee_orange_distance("right_ee_frame") < self._GRIP_STOP_DISTANCE
-
-        left_stop_close = torch.logical_and(torch.logical_or(left_grasped, left_near_orange), left_closing_cmd)
-        right_stop_close = torch.logical_and(torch.logical_or(right_grasped, right_near_orange), right_closing_cmd)
-
-        left_arm_action[:, -1] = torch.where(left_stop_close, left_current_gripper, left_arm_action[:, -1])
-        right_arm_action[:, -1] = torch.where(right_stop_close, right_current_gripper, right_arm_action[:, -1])
-
-        self.scene["left_arm"].set_joint_position_target(left_arm_action)
-        self.scene["right_arm"].set_joint_position_target(right_arm_action)
+        step = self._MAX_GRIPPER_TARGET_STEP
+        left_limited = torch.clamp(left_target, left_gripper_curr - step, left_gripper_curr + step)
+        right_limited = torch.clamp(right_target, right_gripper_curr - step, right_gripper_curr + step)
+        self.actions[:, 5] = torch.where(left_near_closing, left_limited, left_target)
+        self.actions[:, 11] = torch.where(right_near_closing, right_limited, right_target)
 
     def _get_observations(self) -> dict:
         obs = super()._get_observations()

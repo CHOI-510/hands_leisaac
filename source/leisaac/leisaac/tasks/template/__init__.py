@@ -1,4 +1,5 @@
 from .bi_arm_env_cfg import (
+    BiArmActionsCfg,
     BiArmObservationsCfg,
     BiArmTaskEnvCfg,
     BiArmTaskSceneCfg,
